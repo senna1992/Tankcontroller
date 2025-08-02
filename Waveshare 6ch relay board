@@ -1,0 +1,337 @@
+esphome:
+  name: tankcontroller
+  friendly_name: Tankcontroller
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  platformio_options:
+    board_build.flash_mode: dio
+    board_build.flash_size: 16MB
+    # Flash size optimization flags
+    build_flags:
+      - -Os                    # Optimize for size
+      - -ffunction-sections
+      - -fdata-sections
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: arduino
+
+# Globals for Wasserwechsel functionality and temperature control
+globals:
+  - id: wasserwechsel_active
+    type: bool
+    initial_value: 'false'
+  - id: relay_states_backup
+    type: std::vector<bool>
+    initial_value: '{false, false, false, false}'
+  - id: temperature_setpoint
+    type: float
+    initial_value: '23.0'  # Default 23°C
+  - id: slider_value
+    type: float
+    initial_value: '0.5'  # Default low value
+  - id: heating_management_state
+    type: std::string
+    initial_value: '"standby"'
+
+# RS485 focused logging
+logger:
+  level: DEBUG  # Default level for most components
+  logs:
+        uart: DEBUG          # Show all UART/RS485 communication
+        modbus: DEBUG        # Show Modbus protocol messages (if using Modbus)
+        sensor: ERROR         # Show sensor updates
+        component: ERROR     # Suppress most component messages
+        api: ERROR           # Suppress API messages
+        wifi: ERROR          # Suppress WiFi messages
+        ota: INFO            # Keep OTA messages for updates
+
+# API for Home Assistant
+api:
+  encryption:
+    key: !secret ha_api
+
+# OTA updates
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# WiFi configuration
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 20.5dB
+  manual_ip:
+    static_ip: 192.168.0.204
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+  # Removed fallback AP to save flash
+
+# Time sync
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+# Bluetooth Proxy for Home Assistant
+bluetooth_proxy:
+  active: true
+
+select:
+  - platform: logger
+    name: "select logger level"
+
+# RS485 UART interface (onboard)
+uart:
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  id: rs485_uart
+
+# OneWire for temperature sensor
+one_wire:
+  - platform: gpio
+    pin: GPIO6
+
+# Essential binary sensors only
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+  # Wasserwechsel status indicator
+  - platform: template
+    name: "Wasserwechsel"
+    id: wasserwechsel_status
+    icon: "mdi:swap-horizontal"
+    lambda: 'return id(wasserwechsel_active);'
+    entity_category: diagnostic
+
+# Minimal text sensors
+text_sensor:
+  # Heating management status indicator
+  - platform: template
+    name: "Temperaturregelung"
+    id: heating_status
+    icon: "mdi:pool-thermometer"
+    lambda: 'return id(heating_management_state);'
+    entity_category: diagnostic
+    update_interval: 10s
+
+# Relays with Wasserwechsel protection (simplified logic)
+switch:
+  - platform: gpio
+    pin: GPIO1
+    id: relay1
+    name: "Heizung"
+    icon: "mdi:radiator"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay1
+
+  - platform: gpio
+    pin: GPIO2
+    id: relay2
+    name: "Filter"
+    icon: "mdi:pump"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay2
+
+  - platform: gpio
+    pin: GPIO41
+    id: relay3
+    name: "Luftpumpe"
+    icon: "mdi:air-purifier"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay3
+
+  - platform: gpio
+    pin: GPIO42
+    id: relay4
+    name: "Magnetventil"
+    icon: "mdi:molecule-co2"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay4
+
+  - platform: gpio
+    pin: GPIO45
+    id: relay5
+    name: "Licht oben"
+    icon: "mdi:vanity-light"
+
+  - platform: gpio
+    pin: GPIO46
+    id: relay6
+    name: "Licht hinten"
+    icon: "mdi:square"
+
+# Essential buttons
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: config
+  
+  - platform: template
+    name: "Wasserwechsel"
+    id: waterchange
+    icon: "mdi:swap-horizontal"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            // Save states of relays 1-4 and turn them off
+            id(relay_states_backup)[0] = id(relay1).state;
+            id(relay_states_backup)[1] = id(relay2).state;
+            id(relay_states_backup)[2] = id(relay3).state;
+            id(relay_states_backup)[3] = id(relay4).state;
+            
+            id(relay1).turn_off();
+            id(relay2).turn_off();
+            id(relay3).turn_off();
+            id(relay4).turn_off();
+            
+            id(wasserwechsel_active) = true;
+          } else {
+            // Restore states of relays 1-4
+            id(wasserwechsel_active) = false;
+            
+            if (id(relay_states_backup)[0]) id(relay1).turn_on();
+            if (id(relay_states_backup)[1]) id(relay2).turn_on();
+            if (id(relay_states_backup)[2]) id(relay3).turn_on();
+            if (id(relay_states_backup)[3]) id(relay4).turn_on();
+          }
+
+# Essential sensors only
+sensor:
+  - platform: dallas_temp
+    name: "Wassertemperatur" 
+    id: sensor_onewire_temperature
+    address: 0xa5000000bc81c828 # Replace with actual sensor address
+    update_interval: 15s  # Increased interval
+    accuracy_decimals: 1
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 30s
+# Temperature setpoint control
+number:
+  - platform: template
+    name: "Temperaturvorgabe"
+    id: temp_setpoint
+    min_value: 18.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:temperature-celsius"
+    mode: box
+    update_interval: 1s
+    entity_category: config
+    set_action:
+      - globals.set:
+          id: temperature_setpoint
+          value: !lambda 'return x;'
+    lambda: 'return id(temperature_setpoint);'
+
+  - platform: template
+    name: "Regelungsgenauigkeit"
+    id: slider_control
+    min_value: 0.0
+    max_value: 3.0
+    step: 0.5
+    mode: slider
+    icon: "mdi:delta"
+    unit_of_measurement: "°C"
+    update_interval: 1s
+    entity_category: config
+    set_action:
+      - globals.set:
+          id: slider_value
+          value: !lambda 'return x;'
+    lambda: 'return id(slider_value);'
+
+# Temperature control interval
+interval:
+  - interval: 60s  # 1 minute
+    then:
+      - lambda: |-
+          // Only perform temperature control if waterchange is not active
+          if (!id(wasserwechsel_active)) {
+            float current_temp = id(sensor_onewire_temperature).state;
+            float setpoint = id(temperature_setpoint);
+            float hysteresis = id(slider_value);
+            
+            // Check if sensor has a valid reading
+            if (!isnan(current_temp)) {
+              ESP_LOGD("temp_control", "Current: %.1f°C, Setpoint: %.1f°C, Hysteresis: ±%.1f°C", 
+                       current_temp, setpoint, hysteresis);
+              
+              // If temperature exceeds setpoint by hysteresis value -> turn off heating
+              if (current_temp > (setpoint + hysteresis)) {
+                if (id(relay1).state) {
+                  ESP_LOGI("temp_control", "Temperature too high (%.1f°C > %.1f°C) - turning OFF heating", 
+                           current_temp, setpoint + hysteresis);
+                  id(relay1).turn_off();
+                  id(heating_management_state) = "passiv";
+                } else {
+                  id(heating_management_state) = "passiv";
+                }
+              }
+              // If temperature is below setpoint by hysteresis value -> turn on heating
+              else if (current_temp < (setpoint - hysteresis)) {
+                if (!id(relay1).state) {
+                  ESP_LOGI("temp_control", "Temperature too low (%.1f°C < %.1f°C) - turning ON heating", 
+                           current_temp, setpoint - hysteresis);
+                  id(relay1).turn_on();
+                  // Ensure filter is also turned on when heating is activated
+                  if (!id(relay2).state) {
+                    ESP_LOGI("temp_control", "Turning ON filter for circulation during heating");
+                    id(relay2).turn_on();
+                  }
+                  id(heating_management_state) = "aktiv";
+                } else {
+                  // Heating is already on, ensure filter is also on
+                  if (!id(relay2).state) {
+                    ESP_LOGI("temp_control", "Heating is on but filter is off - turning ON filter");
+                    id(relay2).turn_on();
+                  }
+                  id(heating_management_state) = "aktiv";
+                }
+              }
+              // Temperature is within acceptable range - no action needed
+              else {
+                ESP_LOGD("temp_control", "Temperature within range (%.1f°C ± %.1f°C) - no action", 
+                         setpoint, hysteresis);
+                if (id(relay1).state) {
+                  // Heating is on, ensure filter is also on
+                  if (!id(relay2).state) {
+                    ESP_LOGI("temp_control", "Heating is on but filter is off - turning ON filter");
+                    id(relay2).turn_on();
+                  }
+                  id(heating_management_state) = "aktiv";
+                } else {
+                  id(heating_management_state) = "passiv";
+                }
+              }
+            } else {
+              ESP_LOGW("temp_control", "Temperature sensor reading invalid - skipping control");
+              id(heating_management_state) = "sensor defekt";
+            }
+          } else {
+            ESP_LOGD("temp_control", "Skipping temperature control - water change active");
+            id(heating_management_state) = "unterbrochen";
+          }

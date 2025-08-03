@@ -63,7 +63,7 @@ globals:
     initial_value: '0'
   - id: relays_off_hour
     type: int
-    initial_value: '20' # Default 8:00 PM (12 hours later)
+    initial_value: '19' # Default 8:00 PM (12 hours later)
   - id: relays_off_minute
     type: int
     initial_value: '0'
@@ -379,10 +379,11 @@ number:
   - platform: template
     name: "Filter Dauer"
     id: filter_dauer
+    icon: "mdi:timer-edit"
     min_value: 15
     max_value: 45
     step: 15
-    initial_value: 15
+    initial_value: 30
     mode: box
     unit_of_measurement: "min"
     optimistic: true
@@ -390,10 +391,11 @@ number:
   - platform: template
     name: "Luftpumpe Dauer"
     id: luftpumpe_dauer
+    icon: "mdi:timer-edit"    
     min_value: 15
     max_value: 45
     step: 15
-    initial_value: 15
+    initial_value: 30
     mode: box
     unit_of_measurement: "min"
     optimistic: true
@@ -402,8 +404,9 @@ number:
 # Time selection using datetime platform
 datetime:
   - platform: template
-    name: "Licht & CO2 Ein-Zeit"
+    name: "Licht & CO2 An"
     id: relays_on_schedule_time
+    icon: "mdi:lightbulb-cfl"
     type: time
     optimistic: true
     initial_value: "08:00:00"
@@ -415,8 +418,9 @@ datetime:
           id(relays_on_minute) = minute;
           ESP_LOGI("scheduler", "ON time updated: %02d:%02d", hour, minute);
   - platform: template
-    name: "Licht & CO2 Aus-Zeit"
+    name: "Licht & CO2 Aus"
     id: relays_off_schedule_time
+    icon: "mdi:lightbulb-cfl-off"
     type: time
     optimistic: true
     initial_value: "20:00:00"

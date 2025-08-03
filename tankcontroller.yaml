@@ -1,0 +1,638 @@
+esphome:
+  name: tankcontroller
+  friendly_name: Tankcontroller
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  platformio_options:
+    board_build.flash_mode: dio
+    board_build.flash_size: 16MB
+    # Flash size optimization flags
+    build_flags:
+      - -Os # Optimize for size
+      - -ffunction-sections
+      - -fdata-sections
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: arduino
+
+# Globals for Wasserwechsel functionality and temperature control
+globals:
+  - id: wasserwechsel_active
+    type: bool
+    initial_value: 'false'
+  - id: relay_states_backup
+    type: std::vector<bool>
+    initial_value: '{false, false, false, false}'
+  - id: temperature_setpoint
+    type: float
+    initial_value: '23.0' # Default 23°C
+  - id: slider_value
+    type: float
+    initial_value: '0.5' # Default low value
+  - id: heating_management_state
+    type: std::string
+    initial_value: '"standby"'
+  # New globals for enhanced monitoring
+  - id: relay2_off_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: relay3_off_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: heating_start_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: heating_start_temperature
+    type: float
+    initial_value: '0.0'
+  - id: wasserwechsel_start_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: system_status
+    type: std::string
+    initial_value: '"Normal"'
+  # Single scheduling globals for all three relays (4, 5, 6)
+  - id: relays_on_hour
+    type: int
+    initial_value: '8' # Default 8:00 AM
+  - id: relays_on_minute
+    type: int
+    initial_value: '0'
+  - id: relays_off_hour
+    type: int
+    initial_value: '20' # Default 8:00 PM (12 hours later)
+  - id: relays_off_minute
+    type: int
+    initial_value: '0'
+
+# RS485 focused logging
+logger:
+  level: DEBUG # Default level for most components
+  logs:
+    uart: DEBUG # Show all UART/RS485 communication
+    modbus: DEBUG # Show Modbus protocol messages (if using Modbus)
+    sensor: ERROR # Show sensor updates
+    component: ERROR # Suppress most component messages
+    api: ERROR # Suppress API messages
+    wifi: ERROR # Suppress WiFi messages
+    ota: INFO # Keep OTA messages for updates
+
+# API for Home Assistant
+api:
+  encryption:
+    key: !secret ha_api
+
+# OTA updates
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# WiFi configuration
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 20.5dB
+  manual_ip:
+    static_ip: 192.168.0.204
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+
+# Time sync
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+# Bluetooth Proxy for Home Assistant
+bluetooth_proxy:
+  active: true
+
+select:
+  - platform: logger
+    name: "select logger level"
+  - platform: template
+    name: "Filter Betriebsart"
+    id: filter_betriebsart
+    options:
+      - "normal"
+      - "intervall"
+    initial_option: "normal"
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "Luftpumpe Betriebsart"
+    id: luftpumpe_betriebsart
+    options:
+      - "normal"
+      - "intervall"
+    initial_option: "normal"
+    optimistic: true
+    restore_value: true
+
+# RS485 UART interface (onboard)
+uart:
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  id: rs485_uart
+
+# OneWire for temperature sensor
+one_wire:
+  - platform: gpio
+    pin: GPIO6
+
+# Essential binary sensors only
+binary_sensor:
+  - platform: status
+    name: "Status"
+  # Wasserwechsel status indicator
+  - platform: template
+    name: "Wasserwechsel"
+    id: wasserwechsel_status
+    icon: "mdi:swap-horizontal"
+    lambda: 'return id(wasserwechsel_active);'
+    entity_category: diagnostic
+
+# Text sensors including new system status
+text_sensor:
+  # Heating management status indicator
+  - platform: template
+    name: "Temperaturregelung"
+    id: heating_status
+    icon: "mdi:pool-thermometer"
+    lambda: 'return id(heating_management_state);'
+    entity_category: diagnostic
+    update_interval: 10s
+  # System status sensor
+  - platform: template
+    name: "Systemstatus"
+    id: system_status_sensor
+    icon: "mdi:information-outline"
+    lambda: 'return id(system_status);'
+    entity_category: diagnostic
+    update_interval: 10s
+
+# Relays with Wasserwechsel protection and relay 3/4 mutex
+switch:
+  - platform: gpio
+    pin: GPIO1
+    id: relay1
+    name: "Heizung"
+    icon: "mdi:radiator"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay1
+          else:
+            - lambda: |-
+                id(heating_start_timestamp) = millis();
+                float current_temp = id(sensor_onewire_temperature).state;
+                if (!isnan(current_temp)) {
+                  id(heating_start_temperature) = current_temp;
+                  ESP_LOGI("heating", "Heating started at %.1f°C", current_temp);
+                }
+  - platform: gpio
+    pin: GPIO2
+    id: relay2
+    name: "Filter"
+    icon: "mdi:pump"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay2
+          else:
+            - lambda: |-
+                id(relay2_off_timestamp) = 0;
+                ESP_LOGI("filter", "Filter manually turned on - resetting off timer");
+    on_turn_off:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            id(relay2_off_timestamp) = millis();
+            ESP_LOGI("filter", "Filter turned off - starting 60min timer");
+          }
+  - platform: gpio
+    pin: GPIO41
+    id: relay3
+    name: "Luftpumpe"
+    icon: "mdi:air-purifier"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay3
+          else:
+            - lambda: |-
+                id(relay3_off_timestamp) = 0;
+                ESP_LOGI("luftpumpe", "Luftpumpe manually turned on - resetting off timer");
+    on_turn_off:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            id(relay3_off_timestamp) = millis();
+            ESP_LOGI("luftpumpe", "Luftpumpe turned off - starting 60min timer");
+          }
+      - if:
+          condition:
+            lambda: 'return id(relay4).state;'
+          then:
+            - switch.turn_off: relay3
+            - logger.log:
+                format: "Luftpumpe blocked: CO2 (Relay4) is active"
+                level: WARN
+  - platform: gpio
+    pin: GPIO42
+    id: relay4
+    name: "Magnetventil"
+    icon: "mdi:molecule-co2"
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(wasserwechsel_active);'
+          then:
+            - switch.turn_off: relay4
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(relay3).state;'
+                then:
+                  - switch.turn_off: relay3
+                  - logger.log:
+                      format: "Luftpumpe automatically turned off: CO2 activated"
+                      level: INFO
+  - platform: gpio
+    pin: GPIO45
+    id: relay5
+    name: "Licht oben"
+    icon: "mdi:vanity-light"
+  - platform: gpio
+    pin: GPIO46
+    id: relay6
+    name: "Licht hinten"
+    icon: "mdi:square"
+
+# Essential buttons
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: config
+
+  - platform: template
+    name: "Wasserwechsel"
+    id: waterchange
+    icon: "mdi:swap-horizontal"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            id(relay_states_backup)[0] = id(relay1).state;
+            id(relay_states_backup)[1] = id(relay2).state;
+            id(relay_states_backup)[2] = id(relay3).state;
+            id(relay_states_backup)[3] = id(relay4).state;
+
+            id(relay1).turn_off();
+            id(relay2).turn_off();
+            id(relay3).turn_off();
+            id(relay4).turn_off();
+
+            id(relay2_off_timestamp) = 0;
+            id(relay3_off_timestamp) = 0;
+            id(heating_start_timestamp) = 0;
+            id(wasserwechsel_start_timestamp) = millis();
+
+            id(wasserwechsel_active) = true;
+            ESP_LOGI("waterchange", "Water change mode activated");
+          } else {
+            id(wasserwechsel_active) = false;
+            id(wasserwechsel_start_timestamp) = 0;
+
+            if (id(relay_states_backup)[0]) id(relay1).turn_on();
+            if (id(relay_states_backup)[1]) id(relay2).turn_on();
+
+            bool restore_relay3 = id(relay_states_backup)[2];
+            bool restore_relay4 = id(relay_states_backup)[3];
+
+            if (restore_relay3 && restore_relay4) {
+              id(relay4).turn_on();
+              ESP_LOGI("waterchange", "Restored CO2 (relay4) - skipped air pump due to mutex");
+            } else if (restore_relay3) {
+              id(relay3).turn_on();
+            } else if (restore_relay4) {
+              id(relay4).turn_on();
+            }
+
+            ESP_LOGI("waterchange", "Water change mode deactivated - states restored");
+          }
+
+# Essential sensors only
+sensor:
+  - platform: dallas_temp
+    name: "Wassertemperatur"
+    id: sensor_onewire_temperature
+    address: 0xa5000000bc81c828 # Replace with actual sensor address
+    update_interval: 15s
+    accuracy_decimals: 1
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 30s
+
+# Temperature setpoint control and relay scheduling
+number:
+  - platform: template
+    name: "Temperaturvorgabe"
+    id: temp_setpoint
+    min_value: 18.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:temperature-celsius"
+    mode: box
+    update_interval: 1s
+    entity_category: config
+    set_action:
+      - globals.set:
+          id: temperature_setpoint
+          value: !lambda 'return x;'
+    lambda: 'return id(temperature_setpoint);'
+  - platform: template
+    name: "Regelungsgenauigkeit"
+    id: slider_control
+    min_value: 0.0
+    max_value: 3.0
+    step: 0.5
+    mode: slider
+    icon: "mdi:delta"
+    unit_of_measurement: "°C"
+    update_interval: 1s
+    entity_category: config
+    set_action:
+      - globals.set:
+          id: slider_value
+          value: !lambda 'return x;'
+    lambda: 'return id(slider_value);'
+  - platform: template
+    name: "Filter Dauer"
+    id: filter_dauer
+    min_value: 15
+    max_value: 45
+    step: 15
+    initial_value: 15
+    mode: box
+    unit_of_measurement: "min"
+    optimistic: true
+    restore_value: true
+  - platform: template
+    name: "Luftpumpe Dauer"
+    id: luftpumpe_dauer
+    min_value: 15
+    max_value: 45
+    step: 15
+    initial_value: 15
+    mode: box
+    unit_of_measurement: "min"
+    optimistic: true
+    restore_value: true
+
+# Time selection using datetime platform
+datetime:
+  - platform: template
+    name: "Licht & CO2 Ein-Zeit"
+    id: relays_on_schedule_time
+    type: time
+    optimistic: true
+    initial_value: "08:00:00"
+    set_action:
+      - lambda: |-
+          int hour = x.hour;
+          int minute = x.minute;
+          id(relays_on_hour) = hour;
+          id(relays_on_minute) = minute;
+          ESP_LOGI("scheduler", "ON time updated: %02d:%02d", hour, minute);
+  - platform: template
+    name: "Licht & CO2 Aus-Zeit"
+    id: relays_off_schedule_time
+    type: time
+    optimistic: true
+    initial_value: "20:00:00"
+    set_action:
+      - lambda: |-
+          int hour = x.hour;
+          int minute = x.minute;
+          id(relays_off_hour) = hour;
+          id(relays_off_minute) = minute;
+          ESP_LOGI("scheduler", "OFF time updated: %02d:%02d", hour, minute);
+
+# Enhanced temperature control and system monitoring interval
+interval:
+  - interval: 60s # 1 minute
+    then:
+      - lambda: |-
+          float current_temp = id(sensor_onewire_temperature).state;
+          float setpoint = id(temperature_setpoint);
+          float hysteresis = id(slider_value);
+          unsigned long current_time = millis();
+
+          std::string new_status = "Normal";
+
+          if (isnan(current_temp)) {
+            ESP_LOGW("temp_control", "Temperature sensor reading invalid");
+            id(heating_management_state) = "sensor defekt";
+            new_status = "Sensorfehler";
+          } else {
+            if (id(wasserwechsel_active) && id(wasserwechsel_start_timestamp) > 0) {
+              unsigned long waterchange_duration = current_time - id(wasserwechsel_start_timestamp);
+              if (waterchange_duration > 3600000) {
+                ESP_LOGW("system_monitor", "Water change mode active for >60min - check required");
+                new_status = "Dauer Wasserwechsel überschritten - Bitte prüfen";
+              }
+            }
+
+            if (!id(wasserwechsel_active)) {
+              if (current_temp > (setpoint + hysteresis + 2.0)) {
+                ESP_LOGW("system_monitor", "OVERHEATING detected: %.1f°C > %.1f°C", current_temp, setpoint + hysteresis + 2.0);
+                new_status = "Überhitzung";
+                if (id(relay1).state) {
+                  id(relay1).turn_off();
+                  ESP_LOGE("system_monitor", "Emergency heating shutdown due to overheating");
+                }
+              } else if (current_temp < (setpoint - hysteresis - 2.0)) {
+                ESP_LOGW("system_monitor", "UNDERCOOLING detected: %.1f°C < %.1f°C", current_temp, setpoint - hysteresis - 2.0);
+                new_status = "Unterkühlung";
+                if (!id(relay1).state) {
+                  id(relay1).turn_on();
+                  ESP_LOGE("system_monitor", "Emergency heating enable due to undercooling");
+                  if (!id(relay2).state) {
+                    id(relay2).turn_on();
+                    id(relay2_off_timestamp) = 0;
+                    ESP_LOGI("system_monitor", "Emergency filter enable for heating circulation");
+                  }
+                }
+              }
+
+              if (id(relay1).state && id(heating_start_timestamp) > 0) {
+                unsigned long heating_duration = current_time - id(heating_start_timestamp);
+                if (heating_duration > 3600000) {
+                  float temp_increase = current_temp - id(heating_start_temperature);
+                  if (temp_increase < 0.5) {
+                    ESP_LOGW("system_monitor", "HEATING MALFUNCTION: Only %.1f°C increase in 60min", temp_increase);
+                    if (new_status == "Normal") new_status = "Heizungsstörung";
+                  }
+                }
+              }
+
+              if (!id(relay2).state && id(relay2_off_timestamp) > 0) {
+                unsigned long off_duration = current_time - id(relay2_off_timestamp);
+                if (off_duration > 3600000) {
+                  ESP_LOGW("system_monitor", "Filter off for >60min - auto-enabling");
+                  id(relay2).turn_on();
+                  id(relay2_off_timestamp) = 0;
+                  if (new_status == "Normal") new_status = "Filterausfall verhindert";
+                }
+              }
+
+              if (!id(relay3).state && id(relay3_off_timestamp) > 0) {
+                unsigned long off_duration = current_time - id(relay3_off_timestamp);
+                if (off_duration > 3600000) {
+                  ESP_LOGW("system_monitor", "Luftpumpe off for >60min - auto-enabling");
+                  id(relay3).turn_on();
+                  id(relay3_off_timestamp) = 0;
+                  if (new_status == "Normal") new_status = "Luftpumpeausfall verhindert";
+                }
+              }
+
+              ESP_LOGD("temp_control", "Current: %.1f°C, Setpoint: %.1f°C, Hysteresis: ±%.1f°C", current_temp, setpoint, hysteresis);
+
+              if (current_temp > (setpoint + hysteresis)) {
+                if (id(relay1).state) {
+                  ESP_LOGI("temp_control", "Temperature too high (%.1f°C > %.1f°C) - turning OFF heating", current_temp, setpoint + hysteresis);
+                  id(relay1).turn_off();
+                  id(heating_management_state) = "passiv";
+                  id(heating_start_timestamp) = 0;
+                } else {
+                  id(heating_management_state) = "passiv";
+                }
+              } else if (current_temp < (setpoint - hysteresis)) {
+                if (!id(relay1).state) {
+                  ESP_LOGI("temp_control", "Temperature too low (%.1f°C < %.1f°C) - turning ON heating", current_temp, setpoint - hysteresis);
+                  id(relay1).turn_on();
+                  if (!id(relay2).state) {
+                    ESP_LOGI("temp_control", "Turning ON filter for circulation during heating");
+                    id(relay2).turn_on();
+                    id(relay2_off_timestamp) = 0;
+                  }
+                  id(heating_management_state) = "aktiv";
+                } else {
+                  if (!id(relay2).state) {
+                    ESP_LOGI("temp_control", "Heating is on but filter is off - turning ON filter");
+                    id(relay2).turn_on();
+                    id(relay2_off_timestamp) = 0;
+                  }
+                  id(heating_management_state) = "aktiv";
+                }
+              } else {
+                ESP_LOGD("temp_control", "Temperature within range (%.1f°C ± %.1f°C) - no action", setpoint, hysteresis);
+                if (id(relay1).state) {
+                  if (!id(relay2).state) {
+                    ESP_LOGI("temp_control", "Heating is on but filter is off - turning ON filter");
+                    id(relay2).turn_on();
+                    id(relay2_off_timestamp) = 0;
+                  }
+                  id(heating_management_state) = "aktiv";
+                } else {
+                  id(heating_management_state) = "passiv";
+                  id(heating_start_timestamp) = 0;
+                }
+              }
+            } else {
+              ESP_LOGD("temp_control", "Skipping temperature control - water change active");
+              id(heating_management_state) = "unterbrochen";
+            }
+          }
+
+          if (new_status == "Normal" && id(relay4).state) {
+            new_status = "Luftpumpe gesperrt";
+          }
+
+          id(system_status) = new_status;
+
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(filter_betriebsart).state == "intervall";'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(filter_dauer).state > 0;'
+                then:
+                  - delay: !lambda 'return id(filter_dauer).state * 60000;'
+                  - switch.turn_on: relay2
+                  - delay: 3600000ms # Wait for 60 minutes minus the duration
+
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(luftpumpe_betriebsart).state == "intervall";'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(luftpumpe_dauer).state > 0;'
+                then:
+                  - delay: !lambda 'return id(luftpumpe_dauer).state * 60000;'
+                  - switch.turn_on: relay3
+                  - delay: 3600000ms # Wait for 60 minutes minus the duration
+
+  - interval: 60s # Check every minute
+    then:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            auto time = id(homeassistant_time).now();
+            if (time.is_valid()) {
+              int current_hour = time.hour;
+              int current_minute = time.minute;
+
+              if (current_hour == id(relays_on_hour) && current_minute == id(relays_on_minute)) {
+                ESP_LOGI("scheduler", "Scheduled ON: All relays (4,5,6) at %02d:%02d", current_hour, current_minute);
+
+                if (!id(relay4).state) {
+                  id(relay4).turn_on();
+                  ESP_LOGI("scheduler", "Relay4 (CO2) turned ON");
+                }
+                if (!id(relay5).state) {
+                  id(relay5).turn_on();
+                  ESP_LOGI("scheduler", "Relay5 (Light Top) turned ON");
+                }
+                if (!id(relay6).state) {
+                  id(relay6).turn_on();
+                  ESP_LOGI("scheduler", "Relay6 (Light Back) turned ON");
+                }
+              }
+
+              if (current_hour == id(relays_off_hour) && current_minute == id(relays_off_minute)) {
+                ESP_LOGI("scheduler", "Scheduled OFF: All relays (4,5,6) at %02d:%02d", current_hour, current_minute);
+                if (id(relay4).state) {
+                  id(relay4).turn_off();
+                  ESP_LOGI("scheduler", "Relay4 (CO2) turned OFF");
+                }
+                if (id(relay5).state) {
+                  id(relay5).turn_off();
+                  ESP_LOGI("scheduler", "Relay5 (Light Top) turned OFF");
+                }
+                if (id(relay6).state) {
+                  id(relay6).turn_off();
+                  ESP_LOGI("scheduler", "Relay6 (Light Back) turned OFF");
+                }
+              }
+            } else {
+              ESP_LOGW("scheduler", "Time not available - skipping relay scheduling");
+            }
+          } else {
+            ESP_LOGD("scheduler", "Skipping relay scheduling - water change active");
+          }

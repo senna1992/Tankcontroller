@@ -1,0 +1,804 @@
+esphome:
+  name: tankcontroller-120l
+  friendly_name: Tankcontroller-120L
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  platformio_options:
+    board_build.flash_mode: dio
+    board_build.flash_size: 16MB
+    build_flags:
+      - -Os
+      - -ffunction-sections
+      - -fdata-sections
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: arduino
+
+# =============================================================================
+# GLOBAL VARIABLES
+# =============================================================================
+globals:
+  - id: wasserwechsel_active
+    type: bool
+    initial_value: 'false'
+  - id: relay_states_backup
+    type: std::vector<bool>
+    initial_value: '{false, false, false, false}'
+  - id: temperature_setpoint
+    type: float
+    initial_value: '25.0'
+  - id: slider_value
+    type: float
+    initial_value: '0.5'
+  - id: heating_management_state
+    type: std::string
+    initial_value: '"standby"'
+  - id: relay2_off_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: heating_start_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: heating_start_temperature
+    type: float
+    initial_value: '0.0'
+  - id: wasserwechsel_start_timestamp
+    type: unsigned long
+    initial_value: '0'
+  - id: system_status
+    type: std::string
+    initial_value: '"Normal"'
+  - id: relays_on_hour
+    type: int
+    initial_value: '8'
+  - id: relays_on_minute
+    type: int
+    initial_value: '0'
+  - id: relays_off_hour
+    type: int
+    initial_value: '19'
+  - id: relays_off_minute
+    type: int
+    initial_value: '0'
+
+# =============================================================================
+# BASIC CONFIGURATION
+# =============================================================================
+logger:
+  level: DEBUG
+  logs:
+    uart: DEBUG
+    modbus: DEBUG
+    sensor: ERROR
+    component: ERROR
+    api: ERROR
+    wifi: ERROR
+    ota: INFO
+
+api:
+  encryption:
+    key: !secret ha_api
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 20.5dB
+  manual_ip:
+    static_ip: 192.168.0.205
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+bluetooth_proxy:
+  active: true
+
+select:
+  - platform: logger
+    name: "select logger level"
+
+uart:
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  id: rs485_uart
+
+one_wire:
+  - platform: gpio
+    pin: GPIO6
+
+# =============================================================================
+# PURE I/O DEFINITIONS (NO LOGIC - ONLY ID REFERENCES)
+# =============================================================================
+
+# Physical relay outputs - pure I/O only
+switch:
+  - platform: gpio
+    pin: GPIO1
+    id: relay1
+    name: "Heizung"
+    icon: "mdi:radiator"
+    on_turn_on:
+      - script.execute: handle_relay1_on
+    on_turn_off:
+      - script.execute: handle_relay1_off
+
+  - platform: gpio
+    pin: GPIO2
+    id: relay2
+    name: "Filter"
+    icon: "mdi:pump"
+    on_turn_on:
+      - script.execute: handle_relay2_on
+    on_turn_off:
+      - script.execute: handle_relay2_off
+
+  - platform: gpio
+    pin: GPIO41
+    id: relay3
+    name: "Luftpumpe"
+    icon: "mdi:air-purifier"
+    on_turn_on:
+      - script.execute: handle_relay3_on
+    on_turn_off:
+      - script.execute: handle_relay3_off
+
+  - platform: gpio
+    pin: GPIO42
+    id: relay4
+    name: "Magnetventil"
+    icon: "mdi:molecule-co2"
+    on_turn_on:
+      - script.execute: handle_relay4_on
+    on_turn_off:
+      - script.execute: handle_relay4_off
+
+  - platform: gpio
+    pin: GPIO45
+    id: relay5
+    name: "Licht oben"
+    icon: "mdi:vanity-light"
+    on_turn_on:
+      - script.execute: handle_relay5_on
+    on_turn_off:
+      - script.execute: handle_relay5_off
+
+  - platform: gpio
+    pin: GPIO46
+    id: relay6
+    name: "Skimmer"
+    icon: "mdi:cup-water"
+    on_turn_on:
+      - script.execute: handle_relay6_on
+    on_turn_off:
+      - script.execute: handle_relay6_off
+
+# Physical temperature sensor - pure I/O only
+sensor:
+  - platform: dallas_temp
+    name: "Wassertemperatur" 
+    id: sensor_onewire_temperature
+    address: 0x2c000000bcc97b28
+    update_interval: 15s
+    accuracy_decimals: 1
+    on_value:
+      - script.execute: handle_temperature_update
+    
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 30s
+
+# Status sensors - pure display (reference globals via ID)
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+  - platform: template
+    name: "Wasserwechsel"
+    id: wasserwechsel_status
+    icon: "mdi:swap-horizontal"
+    lambda: 'return id(wasserwechsel_active);'
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    name: "Temperaturregelung"
+    id: heating_status
+    icon: "mdi:pool-thermometer"
+    lambda: 'return id(heating_management_state);'
+    entity_category: diagnostic
+    update_interval: 10s
+
+  - platform: template
+    name: "Systemstatus"
+    id: system_status_sensor
+    icon: "mdi:information-outline"
+    lambda: 'return id(system_status);'
+    entity_category: diagnostic
+    update_interval: 5s
+
+# User interface controls - pure I/O (link to logic via scripts)
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: config
+  
+  - platform: template
+    name: "Wasserwechsel"
+    id: waterchange
+    icon: "mdi:swap-horizontal"
+    entity_category: config
+    on_press:
+      - script.execute: wasserwechsel_toggle
+
+number:
+  - platform: template
+    name: "Temperaturvorgabe"
+    id: temp_setpoint
+    min_value: 18.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:temperature-celsius"
+    mode: box
+    update_interval: 1s
+    entity_category: config
+    set_action:
+      - script.execute:
+          id: handle_setpoint_change
+          new_value: !lambda 'return x;'
+    lambda: 'return id(temperature_setpoint);'
+
+  - platform: template
+    name: "Regelungsgenauigkeit"
+    id: slider_control
+    min_value: 0.0
+    max_value: 3.0
+    step: 0.5
+    mode: slider
+    icon: "mdi:delta"
+    unit_of_measurement: "°C"
+    update_interval: 1s
+    entity_category: config
+    set_action:
+      - script.execute:
+          id: handle_hysteresis_change
+          new_value: !lambda 'return x;'
+    lambda: 'return id(slider_value);'
+
+datetime:
+  - platform: template
+    name: "Licht & CO2 Ein-Zeit"
+    id: relays_on_schedule_time
+    type: time
+    optimistic: true
+    initial_value: "08:00:00"
+    set_action:
+      - script.execute:
+          id: handle_on_time_change
+          hour: !lambda 'return x.hour;'
+          minute: !lambda 'return x.minute;'
+
+  - platform: template
+    name: "Licht & CO2 Aus-Zeit"
+    id: relays_off_schedule_time
+    type: time
+    optimistic: true
+    initial_value: "19:00:00"
+    set_action:
+      - script.execute:
+          id: handle_off_time_change
+          hour: !lambda 'return x.hour;'
+          minute: !lambda 'return x.minute;'
+
+# =============================================================================
+# LOGIC SCRIPTS - ALL BUSINESS LOGIC SEPARATED FROM I/O
+# =============================================================================
+
+script:
+  # =============================================================================
+  # RELAY EVENT HANDLERS - Bridge I/O events to business logic
+  # =============================================================================
+  
+  - id: handle_relay1_on
+    mode: single
+    then:
+      - script.execute: 
+          id: relay_protection_logic
+          relay_id: 1
+          action: "on"
+      - script.execute: heating_start_logic
+
+  - id: handle_relay1_off
+    mode: single
+    then:
+      - script.execute: heating_stop_logic
+
+  - id: handle_relay2_on
+    mode: single
+    then:
+      - script.execute: 
+          id: relay_protection_logic
+          relay_id: 2
+          action: "on"
+      - script.execute: filter_start_logic
+
+  - id: handle_relay2_off
+    mode: single
+    then:
+      - script.execute: filter_stop_logic
+
+  - id: handle_relay3_on
+    mode: single
+    then:
+      - script.execute: 
+          id: relay_protection_logic
+          relay_id: 3
+          action: "on"
+      - script.execute: airpump_mutex_logic
+
+  - id: handle_relay3_off
+    mode: single
+    then:
+      - script.execute: airpump_stop_logic
+
+  - id: handle_relay4_on
+    mode: single
+    then:
+      - script.execute: 
+          id: relay_protection_logic
+          relay_id: 4
+          action: "on"
+      - script.execute: co2_mutex_logic
+
+  - id: handle_relay4_off
+    mode: single
+    then:
+      - script.execute: co2_stop_logic
+
+  - id: handle_relay5_on
+    mode: single
+    then:
+      - script.execute: light1_start_logic
+
+  - id: handle_relay5_off
+    mode: single
+    then:
+      - script.execute: light1_stop_logic
+
+  - id: handle_relay6_on
+    mode: single
+    then:
+      - script.execute: light2_start_logic
+
+  - id: handle_relay6_off
+    mode: single
+    then:
+      - script.execute: light2_stop_logic
+
+  # =============================================================================
+  # UI EVENT HANDLERS - Bridge UI changes to business logic
+  # =============================================================================
+  
+  - id: handle_temperature_update
+    mode: single
+    then:
+      - script.execute: temperature_control_logic
+
+  - id: handle_setpoint_change
+    mode: single
+    parameters:
+      new_value: float
+    then:
+      - script.execute:
+          id: setpoint_update_logic
+          value: !lambda 'return new_value;'
+
+  - id: handle_hysteresis_change
+    mode: single
+    parameters:
+      new_value: float
+    then:
+      - script.execute:
+          id: hysteresis_update_logic
+          value: !lambda 'return new_value;'
+
+  - id: handle_on_time_change
+    mode: single
+    parameters:
+      hour: int
+      minute: int
+    then:
+      - script.execute:
+          id: schedule_on_update_logic
+          h: !lambda 'return hour;'
+          m: !lambda 'return minute;'
+
+  - id: handle_off_time_change
+    mode: single
+    parameters:
+      hour: int
+      minute: int
+    then:
+      - script.execute:
+          id: schedule_off_update_logic
+          h: !lambda 'return hour;'
+          m: !lambda 'return minute;'
+
+  # =============================================================================
+  # CORE BUSINESS LOGIC - Pure logic, no I/O references
+  # =============================================================================
+
+  # Water Change Management Logic
+  - id: wasserwechsel_toggle
+    mode: single
+    then:
+      - script.execute: wasserwechsel_logic
+
+  - id: wasserwechsel_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            ESP_LOGI("waterchange", "Activating water change mode");
+            // Save current states
+            id(relay_states_backup)[0] = id(relay1).state;
+            id(relay_states_backup)[1] = id(relay2).state;
+            id(relay_states_backup)[2] = id(relay3).state;
+            id(relay_states_backup)[3] = id(relay4).state;
+            
+            // Turn off protected relays
+            id(relay1).turn_off();
+            id(relay2).turn_off();
+            id(relay3).turn_off();
+            id(relay4).turn_off();
+            
+            // Reset timestamps
+            id(relay2_off_timestamp) = 0;
+            id(heating_start_timestamp) = 0;
+            id(wasserwechsel_start_timestamp) = millis();
+            id(wasserwechsel_active) = true;
+          } else {
+            ESP_LOGI("waterchange", "Deactivating water change mode");
+            id(wasserwechsel_active) = false;
+            id(wasserwechsel_start_timestamp) = 0;
+            
+            // Restore states with mutex logic
+            if (id(relay_states_backup)[0]) id(relay1).turn_on();
+            if (id(relay_states_backup)[1]) id(relay2).turn_on();
+            
+            bool restore_relay3 = id(relay_states_backup)[2];
+            bool restore_relay4 = id(relay_states_backup)[3];
+            
+            if (restore_relay3 && restore_relay4) {
+              id(relay4).turn_on();
+              ESP_LOGI("waterchange", "Restored CO2 - skipped air pump due to mutex");
+            } else if (restore_relay3) {
+              id(relay3).turn_on();
+            } else if (restore_relay4) {
+              id(relay4).turn_on();
+            }
+          }
+
+  # Relay Protection Logic
+  - id: relay_protection_logic
+    mode: queued
+    parameters:
+      relay_id: int
+      action: string
+    then:
+      - lambda: |-
+          if (id(wasserwechsel_active)) {
+            ESP_LOGW("protection", "Relay %d blocked - water change active", relay_id);
+            switch(relay_id) {
+              case 1: id(relay1).turn_off(); break;
+              case 2: id(relay2).turn_off(); break;
+              case 3: id(relay3).turn_off(); break;
+              case 4: id(relay4).turn_off(); break;
+            }
+          }
+
+  # Mutex Logic Scripts
+  - id: airpump_mutex_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (id(relay4).state) {
+            ESP_LOGW("mutex", "Air pump blocked - CO2 active");
+            id(relay3).turn_off();
+          }
+
+  - id: co2_mutex_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (id(relay3).state) {
+            ESP_LOGI("mutex", "Air pump turned off - CO2 activated");
+            id(relay3).turn_off();
+          }
+
+  # Heating Logic Scripts
+  - id: heating_start_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            id(heating_start_timestamp) = millis();
+            float temp = id(sensor_onewire_temperature).state;
+            if (!isnan(temp)) {
+              id(heating_start_temperature) = temp;
+              ESP_LOGI("heating", "Started at %.1f°C", temp);
+            }
+          }
+
+  - id: heating_stop_logic
+    mode: single
+    then:
+      - lambda: |-
+          id(heating_start_timestamp) = 0;
+          ESP_LOGI("heating", "Stopped");
+
+  # Filter Logic Scripts
+  - id: filter_start_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            id(relay2_off_timestamp) = 0;
+            ESP_LOGI("filter", "Started - timer reset");
+          }
+
+  - id: filter_stop_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(wasserwechsel_active)) {
+            id(relay2_off_timestamp) = millis();
+            ESP_LOGI("filter", "Stopped - starting 60min timer");
+          }
+
+  # Simple placeholder scripts for other relays
+  - id: airpump_stop_logic
+    mode: single
+    then:
+      - lambda: 'ESP_LOGD("airpump", "Stopped");'
+
+  - id: co2_stop_logic
+    mode: single
+    then:
+      - lambda: 'ESP_LOGD("co2", "Stopped");'
+
+  - id: light1_start_logic
+    mode: single
+    then:
+      - lambda: 'ESP_LOGD("light1", "Started");'
+
+  - id: light1_stop_logic
+    mode: single
+    then:
+      - lambda: 'ESP_LOGD("light1", "Stopped");'
+
+  - id: light2_start_logic
+    mode: single
+    then:
+      - lambda: 'ESP_LOGD("skimmer", "Started");'
+
+  - id: light2_stop_logic
+    mode: single
+    then:
+      - lambda: 'ESP_LOGD("skimmer", "Stopped");'
+
+  # Temperature Control Logic
+  - id: temperature_control_logic
+    mode: single
+    then:
+      - lambda: |-
+          float temp = id(sensor_onewire_temperature).state;
+          float setpoint = id(temperature_setpoint);
+          float hysteresis = id(slider_value);
+          
+          if (isnan(temp)) {
+            id(heating_management_state) = "sensor defekt";
+            id(system_status) = "Sensorfehler";
+            return;
+          }
+          
+          if (id(wasserwechsel_active)) {
+            id(heating_management_state) = "unterbrochen";
+            return;
+          }
+          
+          // Emergency checks
+          if (temp > (setpoint + hysteresis + 2.0)) {
+            ESP_LOGW("emergency", "OVERHEATING: %.1f°C", temp);
+            id(system_status) = "Überhitzung";
+            if (id(relay1).state) id(relay1).turn_off();
+            return;
+          }
+          
+          if (temp < (setpoint - hysteresis - 2.0)) {
+            ESP_LOGW("emergency", "UNDERCOOLING: %.1f°C", temp);
+            id(system_status) = "Unterkühlung";
+            if (!id(relay1).state) {
+              id(relay1).turn_on();
+              if (!id(relay2).state) id(relay2).turn_on();
+            }
+            return;
+          }
+          
+          // Normal control
+          if (temp > (setpoint + hysteresis)) {
+            if (id(relay1).state) {
+              ESP_LOGI("temp", "Too high - heating OFF");
+              id(relay1).turn_off();
+            }
+            id(heating_management_state) = "passiv";
+          } else if (temp < (setpoint - hysteresis)) {
+            if (!id(relay1).state) {
+              ESP_LOGI("temp", "Too low - heating ON");
+              id(relay1).turn_on();
+              if (!id(relay2).state) id(relay2).turn_on();
+            }
+            id(heating_management_state) = "aktiv";
+          } else {
+            if (id(relay1).state && !id(relay2).state) {
+              id(relay2).turn_on();
+            }
+            id(heating_management_state) = id(relay1).state ? "aktiv" : "passiv";
+          }
+
+  # Settings Update Logic
+  - id: setpoint_update_logic
+    mode: single
+    parameters:
+      value: float
+    then:
+      - globals.set:
+          id: temperature_setpoint
+          value: !lambda 'return value;'
+      - lambda: 'ESP_LOGI("settings", "Setpoint: %.1f°C", value);'
+
+  - id: hysteresis_update_logic
+    mode: single
+    parameters:
+      value: float
+    then:
+      - globals.set:
+          id: slider_value
+          value: !lambda 'return value;'
+      - lambda: 'ESP_LOGI("settings", "Hysteresis: %.1f°C", value);'
+
+  # Schedule Update Logic
+  - id: schedule_on_update_logic
+    mode: single
+    parameters:
+      h: int
+      m: int
+    then:
+      - lambda: |-
+          id(relays_on_hour) = h;
+          id(relays_on_minute) = m;
+          ESP_LOGI("scheduler", "ON time: %02d:%02d", h, m);
+
+  - id: schedule_off_update_logic
+    mode: single
+    parameters:
+      h: int
+      m: int
+    then:
+      - lambda: |-
+          id(relays_off_hour) = h;
+          id(relays_off_minute) = m;
+          ESP_LOGI("scheduler", "OFF time: %02d:%02d", h, m);
+
+  # System Monitoring Logic
+  - id: system_monitoring_logic
+    mode: single
+    then:
+      - lambda: |-
+          unsigned long now = millis();
+          
+          // Update system status display
+          if (!id(wasserwechsel_active) && id(relay4).state && !id(relay3).state) {
+            id(system_status) = "Luftpumpe gesperrt";
+            return;
+          }
+          
+          // Water change duration check
+          if (id(wasserwechsel_active) && id(wasserwechsel_start_timestamp) > 0) {
+            if ((now - id(wasserwechsel_start_timestamp)) > 3600000) {
+              id(system_status) = "Dauer Wasserwechsel überschritten";
+              return;
+            }
+          }
+          
+          // Heating malfunction check
+          if (id(relay1).state && id(heating_start_timestamp) > 0) {
+            if ((now - id(heating_start_timestamp)) > 3600000) {
+              float temp = id(sensor_onewire_temperature).state;
+              if (!isnan(temp) && (temp - id(heating_start_temperature)) < 0.1) {
+                ESP_LOGW("monitor", "Heating malfunction detected");
+                id(system_status) = "Heizungsstörung";
+                return;
+              }
+            }
+          }
+          
+          // Filter off duration check
+          if (!id(relay2).state && id(relay2_off_timestamp) > 0) {
+            if ((now - id(relay2_off_timestamp)) > 3600000) {
+              ESP_LOGW("monitor", "Auto-enabling filter after 60min");
+              id(relay2).turn_on();
+              id(relay2_off_timestamp) = 0;
+              id(system_status) = "Filterausfall verhindert";
+              return;
+            }
+          }
+          
+          // If no issues, set normal status
+          if (id(system_status) != "Normal") {
+            id(system_status) = "Normal";
+          }
+
+  # Daily Scheduler Logic
+  - id: daily_scheduler_logic
+    mode: single
+    then:
+      - lambda: |-
+          if (id(wasserwechsel_active)) return;
+          
+          auto time = id(homeassistant_time).now();
+          if (!time.is_valid()) return;
+          
+          int hour = time.hour;
+          int minute = time.minute;
+          
+          // Day cycle start
+          if (hour == id(relays_on_hour) && minute == id(relays_on_minute)) {
+            ESP_LOGI("scheduler", "DAY CYCLE START");
+            if (!id(relay4).state) id(relay4).turn_on();
+            if (!id(relay5).state) id(relay5).turn_on();
+            // Skimmer (relay6) is NOT automatically turned on during day cycle
+          }
+          
+          // Night cycle start  
+          if (hour == id(relays_off_hour) && minute == id(relays_off_minute)) {
+            ESP_LOGI("scheduler", "NIGHT CYCLE START");
+            if (id(relay4).state) id(relay4).turn_off();
+            if (id(relay5).state) id(relay5).turn_off();
+            // Turn OFF skimmer during night mode
+            if (id(relay6).state) {
+              id(relay6).turn_off();
+              ESP_LOGI("scheduler", "Skimmer turned OFF for night mode");
+            }
+            if (!id(relay3).state) id(relay3).turn_on();
+          }
+
+# =============================================================================
+# SCHEDULED LOGIC EXECUTION - Timer-based logic calls
+# =============================================================================
+interval:
+  # Temperature Control (30s for responsive control)
+  - interval: 30s
+    then:
+      - script.execute: temperature_control_logic
+
+  # System Monitoring (60s)
+  - interval: 60s
+    then:
+      - script.execute: system_monitoring_logic
+
+  # Daily Scheduler (60s)
+  - interval: 60s
+    then:
+      - script.execute: daily_scheduler_logic

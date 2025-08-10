@@ -1,0 +1,77 @@
+esphome:
+  name: watchdog-70l
+  friendly_name: Watchdog-70L
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32dev  # Standard board for ESP32-WROOM-32D
+  framework:
+    type: arduino
+
+# RS485 focused logging
+logger:
+  level: ERROR
+
+# API for Home Assistant
+api:
+  encryption:
+    key: !secret ha_api
+
+# OTA updates
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# WiFi configuration
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 20.5dB
+  manual_ip:
+    static_ip: 192.168.0.206  # Your board's IP
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+
+# Time sync
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+select:
+  - platform: logger
+    name: "select logger level"
+
+# Status sensor
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+# GPIO15 Relay Control - internal switch
+switch:
+  - platform: gpio
+    pin: GPIO15  # D15 on ESP32-WROOM-32D
+    id: relay_gpio15
+    restore_mode: RESTORE_DEFAULT_OFF  # Starts OFF after reboot
+    internal: true  # Hide from Home Assistant
+
+# Basic sensors
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# Restart button
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+  
+  # GPIO15 Relay Button - momentary pulse on press
+  - platform: template
+    name: "GPIO15 Relay"
+    icon: "mdi:gesture-tap-button"
+    on_press:
+      - switch.turn_on: relay_gpio15
+      - delay: 500ms
+      - switch.turn_off: relay_gpio15

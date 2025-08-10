@@ -1,6 +1,6 @@
 esphome:
-  name: tankcontroller
-  friendly_name: Tankcontroller
+  name: tankcontroller-70l
+  friendly_name: Tankcontroller-70L
   min_version: 2024.6.0
   name_add_mac_suffix: false
   platformio_options:
@@ -67,15 +67,7 @@ globals:
 
 # RS485 focused logging
 logger:
-  level: DEBUG  # Default level for most components
-  logs:
-        uart: DEBUG          # Show all UART/RS485 communication
-        modbus: DEBUG        # Show Modbus protocol messages (if using Modbus)
-        sensor: ERROR         # Show sensor updates
-        component: ERROR     # Suppress most component messages
-        api: ERROR           # Suppress API messages
-        wifi: ERROR          # Suppress WiFi messages
-        ota: INFO            # Keep OTA messages for updates
+  level: ERROR  # Default level for most components
 
 # API for Home Assistant
 api:
@@ -135,6 +127,25 @@ binary_sensor:
     icon: "mdi:swap-horizontal"
     lambda: 'return id(wasserwechsel_active);'
     entity_category: diagnostic
+
+  # External reboot trigger on GPIO10
+  - platform: gpio
+    pin:
+      number: GPIO10
+      mode:
+        input: true
+        pulldown: true  # Use internal pulldown, so pin is LOW when not triggered
+    name: "External Reboot Trigger"
+    id: external_reboot_trigger
+    device_class: "problem"
+    entity_category: diagnostic
+    filters:
+      - delayed_on: 100ms  # Debounce to avoid false triggers
+    on_press:
+      - logger.log:
+          format: "External reboot triggered via GPIO10"
+          level: WARN
+      - button.press: restart_button
 
 # Text sensors including new system status
 text_sensor:
@@ -553,7 +564,7 @@ interval:
           // Update system status
           id(system_status) = new_status;
 
-  # Daily scheduler for relays 4, 5, and 6 with mutex respect
+  # Daily scheduler for relays 4, 5, and 6 with air pump automation
   - interval: 60s  # Check every minute
     then:
       - lambda: |-
@@ -564,9 +575,9 @@ interval:
               int current_hour = time.hour;
               int current_minute = time.minute;
               
-              // Check if it's time to turn ON all relays (4, 5, 6)
+              // Check if it's time to turn ON lights and CO2 (Day cycle start)
               if (current_hour == id(relays_on_hour) && current_minute == id(relays_on_minute)) {
-                ESP_LOGI("scheduler", "Scheduled ON: All relays (4,5,6) at %02d:%02d", current_hour, current_minute);
+                ESP_LOGI("scheduler", "DAY CYCLE START: Lights & CO2 ON, Air pump OFF at %02d:%02d", current_hour, current_minute);
                 
                 // Turn on relay4 (CO2) first - this will auto-turn off relay3 if needed
                 if (!id(relay4).state) {
@@ -581,11 +592,12 @@ interval:
                   id(relay6).turn_on();
                   ESP_LOGI("scheduler", "Relay6 (Light Back) turned ON");
                 }
+                // Air pump will be automatically turned off by CO2 mutex logic
               }
               
-              // Check if it's time to turn OFF all relays (4, 5, 6)
+              // Check if it's time to turn OFF lights and CO2 (Night cycle start)
               if (current_hour == id(relays_off_hour) && current_minute == id(relays_off_minute)) {
-                ESP_LOGI("scheduler", "Scheduled OFF: All relays (4,5,6) at %02d:%02d", current_hour, current_minute);
+                ESP_LOGI("scheduler", "NIGHT CYCLE START: Lights & CO2 OFF, Air pump ON at %02d:%02d", current_hour, current_minute);
                 if (id(relay4).state) {
                   id(relay4).turn_off();
                   ESP_LOGI("scheduler", "Relay4 (CO2) turned OFF");
@@ -597,6 +609,12 @@ interval:
                 if (id(relay6).state) {
                   id(relay6).turn_off();
                   ESP_LOGI("scheduler", "Relay6 (Light Back) turned OFF");
+                }
+                
+                // Turn ON air pump for night aeration (now that CO2 is off)
+                if (!id(relay3).state) {
+                  id(relay3).turn_on();
+                  ESP_LOGI("scheduler", "Relay3 (Air pump) turned ON for night aeration");
                 }
               }
             } else {
